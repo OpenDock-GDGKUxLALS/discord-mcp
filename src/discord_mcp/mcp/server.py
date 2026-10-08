@@ -2,20 +2,82 @@ import contextvars
 
 from fastmcp import FastMCP
 from fastmcp.contrib.bulk_tool_caller import BulkToolCaller
-from fastmcp.server.dependencies import get_http_request
+from fastmcp.exceptions import ToolError
+from fastmcp.server.dependencies import get_access_token, get_http_request
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 
+from discord_mcp.config import settings
 from discord_mcp.discord.events import event_stream_manager
 from discord_mcp.discord.session import session_manager
+from discord_mcp.mcp.oauth import CONSENT_PATH, SCOPE_WRITE, ConsentOAuthProvider
 from discord_mcp.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-mcp = FastMCP("Discord MCP Server")
+READ_TOOL_PREFIXES = ("get_", "list_", "view_", "inspect_", "fetch_", "check_")
+BULK_TOOLS = ("call_tools_bulk", "call_tool_bulk")
+
+
+def _build_oauth_provider() -> ConsentOAuthProvider | None:
+    """OAuth is on when an admin token is configured. The server then acts with
+    its own bot token and the Authorization header carries one of our tokens;
+    otherwise the header is the caller's bot token, as before."""
+    if not settings.mcp.admin_token:
+        return None
+    if not settings.discord.bot_token or not settings.mcp.public_url:
+        raise RuntimeError(
+            "MCP_ADMIN_TOKEN turns on OAuth, which also needs DISCORD_BOT_TOKEN and MCP_PUBLIC_URL"
+        )
+    return ConsentOAuthProvider(
+        public_url=settings.mcp.public_url,
+        admin_token=settings.mcp.admin_token,
+        data_dir=settings.mcp.data_dir,
+    )
+
+
+oauth_provider = _build_oauth_provider()
+
+mcp = FastMCP("Discord MCP Server", auth=oauth_provider)
+
+if oauth_provider:
+    mcp.custom_route(CONSENT_PATH, methods=["GET", "POST"], include_in_schema=False)(
+        oauth_provider.consent_endpoint
+    )
 
 current_session_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "current_session_id", default=None
 )
+
+
+def is_read_tool(name: str, arguments: dict | None = None) -> bool:
+    """Whether a call changes nothing on Discord. A bulk call is as harmless as
+    the calls inside it; a tool that is not recognizably read-only is not."""
+    arguments = arguments or {}
+    if name == "call_tool_bulk":
+        return is_read_tool(str(arguments.get("tool", "")))
+    if name == "call_tools_bulk":
+        calls = arguments.get("tool_calls") or []
+        return all(
+            isinstance(call, dict) and is_read_tool(str(call.get("tool", "")), call.get("arguments"))
+            for call in calls
+        )
+    return name.startswith(READ_TOOL_PREFIXES)
+
+
+def _can_write() -> bool:
+    if not oauth_provider:
+        return True
+    access_token = get_access_token()
+    return access_token is not None and SCOPE_WRITE in access_token.scopes
+
+
+def _authorization_header() -> str:
+    if oauth_provider:
+        return settings.discord.bot_token
+    try:
+        return get_http_request().headers.get("Authorization", "")
+    except RuntimeError:
+        return ""
 
 
 async def authenticate_and_get_session(auth_header: str) -> str:
@@ -75,28 +137,36 @@ class AuthMiddleware(Middleware):
         call_next,
     ):
         # Start Discord bot when MCP session initializes
-        request = get_http_request()
-        if request:
-            auth_header = request.headers.get("Authorization", "")
-            if auth_header:
-                try:
-                    session_id = await authenticate_and_get_session(auth_header)
-                    current_session_id.set(session_id)
-                    logger.info("bot_started_on_session_init", session_id=session_id)
-                except Exception as e:
-                    logger.error("bot_start_failed_on_init", error=str(e))
+        auth_header = _authorization_header()
+        if auth_header:
+            try:
+                session_id = await authenticate_and_get_session(auth_header)
+                current_session_id.set(session_id)
+                logger.info("bot_started_on_session_init", session_id=session_id)
+            except Exception as e:
+                logger.error("bot_start_failed_on_init", error=str(e))
 
         return await call_next(context)
+
+    async def on_list_tools(
+        self,
+        context: MiddlewareContext,
+        call_next,
+    ):
+        tools = await call_next(context)
+        if _can_write():
+            return tools
+        return [tool for tool in tools if tool.name in BULK_TOOLS or is_read_tool(tool.name)]
 
     async def on_call_tool(
         self,
         context: MiddlewareContext,
         call_next,
     ):
-        request = get_http_request()
-        auth_header = ""
-        if request:
-            auth_header = request.headers.get("Authorization", "")
+        if not _can_write() and not is_read_tool(context.message.name, context.message.arguments):
+            raise ToolError("This connection is read-only: it was approved without manage access")
+
+        auth_header = _authorization_header()
 
         if auth_header:
             try:

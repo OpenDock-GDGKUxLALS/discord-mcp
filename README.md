@@ -92,6 +92,54 @@ Example configuration for **OpenCode** using a remote MCP server:
 
 This can be used by any client that supports MCP.
 
+# OAuth (claude.ai custom connectors)
+
+Custom connectors on claude.ai cannot send a fixed header, so the server can
+also act as its own OAuth authorization server. Set these three in `.env`:
+
+```env
+DISCORD_BOT_TOKEN=<token of the bot the server acts as>
+MCP_ADMIN_TOKEN=<openssl rand -hex 32>
+MCP_PUBLIC_URL=https://discord-mcp.example.com
+```
+
+With `MCP_ADMIN_TOKEN` set, the server uses its own bot token and the
+`Authorization` header no longer carries one. Two ways to authenticate:
+
+- **OAuth**: add `$MCP_PUBLIC_URL/mcp` as a connector. Claude registers itself
+  and opens a consent page, where you choose what the connection may do and
+  approve it by entering `MCP_ADMIN_TOKEN`. Only claude.ai / claude.com
+  callbacks and loopback clients can be approved.
+- **Bearer token**: send `Authorization: Bearer $MCP_ADMIN_TOKEN`, e.g.
+  `claude mcp add --transport http discord https://discord-mcp.example.com/mcp --header "Authorization: Bearer ..."`.
+
+## Permissions
+
+The consent page offers two levels. **Read only** connections see just the
+tools that look things up (`get_*`, `list_*`, `view_*`, `inspect_*`, `fetch_*`,
+`check_*`); everything else is hidden from them and refused if called, also
+through the bulk tools. **Read & manage** connections and the admin token get
+every tool. To change the level of a connection, disconnect it and connect
+again.
+
+## Deploying with Docker
+
+`compose.yaml` expects the three variables above in a `.env` next to it:
+
+```bash
+docker compose up -d --build
+```
+
+Put a TLS reverse proxy in front of port 8809 and forward every path (`/mcp`,
+`/.well-known/*`, `/authorize`, `/token`, `/register`, `/revoke`, `/consent`).
+MCP responses can be streamed, so turn off response buffering for it if the
+proxy buffers.
+
+Registered clients and hashed tokens are kept in `data/oauth.json`, so
+connections survive restarts. Deleting the file disconnects every client.
+
+---
+
 ## MCP Tools
 
 ### Channel Management

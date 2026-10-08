@@ -1,0 +1,17 @@
+services:
+  discord-mcp:
+    build: .
+    restart: unless-stopped
+    environment:
+      # Token of the bot the server acts as.
+      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:?set DISCORD_BOT_TOKEN in .env}
+      # Admin token. Generate with: openssl rand -hex 32   (put it in .env next to this file)
+      MCP_ADMIN_TOKEN: ${MCP_ADMIN_TOKEN:?set MCP_ADMIN_TOKEN in .env}
+      # Where the reverse proxy serves this server, e.g. https://discord-mcp.example.com
+      MCP_PUBLIC_URL: ${MCP_PUBLIC_URL:?set MCP_PUBLIC_URL in .env}
+    volumes:
+      - ./data:/data
+    ports:
+      # Point the reverse proxy at this port. Do not expose it directly:
+      # without TLS the tokens travel in the clear.
+      - "8809:8000"

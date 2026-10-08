@@ -1087,6 +1087,8 @@ def main():
         "starting_mcp_server",
         host=settings.mcp.host,
         port=settings.mcp.port,
+        oauth=bool(settings.mcp.admin_token),
+        public_url=settings.mcp.public_url or None,
     )
 
     uvicorn.run(
